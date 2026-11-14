@@ -609,30 +609,26 @@ export const make = Effect.gen(function* () {
       ],
       { concurrency: 2 },
     );
-    // Comment availability must not suppress check results or a permanent detail failure.
-    const read = detailRead;
-    if (Exit.isFailure(read)) {
-      if (Cause.hasInterruptsOnly(read.cause)) return yield* Effect.failCause(read.cause);
+    if (Exit.isFailure(detailRead)) {
+      if (Cause.hasInterruptsOnly(detailRead.cause))
+        return yield* Effect.failCause(detailRead.cause);
       lastReads.delete(group.key);
-      const reason = providerFailureReason(read.cause);
+      const reason = providerFailureReason(detailRead.cause);
       if (reason === "rate-limited") return;
       // Transport and host failures can outlast the failure limit; keep the watch for recovery.
       if (reason === "failed") {
         readFailures.delete(group.key);
-        return yield* Effect.failCause(read.cause);
+        return yield* Effect.failCause(detailRead.cause);
       }
       const failures = (readFailures.get(group.key) ?? 0) + 1;
       readFailures.set(group.key, failures);
       if (failures >= READ_FAILURE_LIMIT && (yield* eachTarget(group, giveUp))) {
         readFailures.delete(group.key);
       }
-      return yield* Effect.failCause(read.cause);
+      return yield* Effect.failCause(detailRead.cause);
     }
     readFailures.delete(group.key);
-    const detail = read.value;
-    const activity = Exit.isSuccess(activityRead)
-      ? activityRead.value
-      : Option.none<PullRequestActivity>();
+    const detail = detailRead.value;
     for (const target of group.targets) {
       const life = lifeOf(target);
       const headSha = detail.headSha ?? life.headSha;
@@ -655,14 +651,19 @@ export const make = Effect.gen(function* () {
       );
     }
 
+    // A failed comments read leaves remarks incomplete, so the next pass reads them again;
+    // checks, head and conflicts from the detail still reach the evaluator.
     if (Exit.isFailure(activityRead)) {
-      if (Cause.hasInterruptsOnly(activityRead.cause))
-        return yield* Effect.failCause(activityRead.cause);
       threadTails.delete(group.key);
-      yield* logFailure("pull request watch activity read failed", { pullRequest: group.key })(
-        activityRead.cause,
-      );
+      if (providerFailureReason(activityRead.cause) !== "rate-limited") {
+        yield* logFailure("pull request watch activity read failed", { pullRequest: group.key })(
+          activityRead.cause,
+        );
+      }
     }
+    const activity = Exit.isSuccess(activityRead)
+      ? activityRead.value
+      : Option.none<PullRequestActivity>();
 
     // Never advance the remark watermark past comments an incomplete read could have missed.
     const remarks = Option.isSome(activity)
